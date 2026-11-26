@@ -49,6 +49,7 @@ pub struct DbtColumn {
     #[serde(default)]
     pub tags: Vec<String>,
     pub policy_tags: Option<Vec<StringOrMap>>,
+    pub data_governance_tags: Option<IndexMap<String, String>>,
     pub classifiers: Option<Vec<String>>,
     pub databricks_tags: Option<IndexMap<String, YmlValue>>,
     pub column_mask: Option<ColumnMask>,
@@ -125,6 +126,7 @@ pub struct ColumnProperties {
     pub granularity: Option<Granularity>,
     #[serde(default, deserialize_with = "policy_tags_from_scalar_or_list")]
     pub policy_tags: Option<Vec<StringOrMap>>,
+    pub data_governance_tags: Option<IndexMap<String, String>>,
     pub classifiers: Option<Vec<String>>,
     pub databricks_tags: Option<IndexMap<String, YmlValue>>,
     pub column_mask: Option<ColumnMask>,
@@ -155,6 +157,7 @@ pub struct VersionColumnProperties {
     pub granularity: Option<Granularity>,
     #[serde(default, deserialize_with = "policy_tags_from_scalar_or_list")]
     pub policy_tags: Option<Vec<StringOrMap>>,
+    pub data_governance_tags: Option<IndexMap<String, String>>,
     pub classifiers: Option<Vec<String>>,
     pub databricks_tags: Option<IndexMap<String, YmlValue>>,
     pub column_mask: Option<ColumnMask>,
@@ -183,6 +186,7 @@ impl VersionColumnProperties {
             data_tests: self.data_tests.clone(),
             granularity: self.granularity.clone(),
             policy_tags: self.policy_tags.clone(),
+            data_governance_tags: self.data_governance_tags.clone(),
             classifiers: self.classifiers.clone(),
             databricks_tags: self.databricks_tags.clone(),
             column_mask: self.column_mask.clone(),
@@ -228,6 +232,7 @@ pub struct ColumnConfig {
     pub databricks_tags: Option<IndexMap<String, YmlValue>>,
     #[serde(default, deserialize_with = "policy_tags_from_scalar_or_list")]
     pub policy_tags: Option<Vec<StringOrMap>>,
+    pub data_governance_tags: Option<IndexMap<String, String>>,
 }
 
 /// Represents column inheritance rules for a model version
@@ -349,10 +354,18 @@ pub fn process_columns(
             // and a later definition silently overwrites an earlier one.
             let mut by_name: IndexMap<String, DbtColumnRef> = IndexMap::new();
             for cp in cols.iter() {
-                let (cp_meta, cp_tags, cp_databricks_tags, cp_policy_tags) = cp
+                let (cp_meta, cp_tags, cp_databricks_tags, cp_policy_tags, cp_dg_tags) = cp
                     .config
                     .clone()
-                    .map(|c| (c.meta, c.tags, c.databricks_tags, c.policy_tags))
+                    .map(|c| {
+                        (
+                            c.meta,
+                            c.tags,
+                            c.databricks_tags,
+                            c.policy_tags,
+                            c.data_governance_tags,
+                        )
+                    })
                     .unwrap_or_default();
                 let column_meta = cp_meta.unwrap_or_default();
 
@@ -368,6 +381,8 @@ pub fn process_columns(
                         .unwrap_or_default(),
                     // Top-level policy_tags takes precedence over config.policy_tags
                     policy_tags: cp.policy_tags.clone().or(cp_policy_tags),
+                    // Top-level data_governance_tags takes precedence over config.data_governance_tags
+                    data_governance_tags: cp.data_governance_tags.clone().or(cp_dg_tags),
                     classifiers: cp.classifiers.clone(),
                     databricks_tags: cp.databricks_tags.clone().or(cp_databricks_tags),
                     column_mask: cp.column_mask.clone(),
@@ -409,6 +424,7 @@ mod tests {
             data_tests: None,
             granularity: None,
             policy_tags: None,
+            data_governance_tags: None,
             classifiers: None,
             databricks_tags: None,
             column_mask: None,
@@ -591,6 +607,141 @@ policy_tags: governance.tags.PII
             StringOrMap::StringValue(s) => assert_eq!(s, "governance.tags.PII"),
             StringOrMap::MapValue(_) => panic!("expected StringValue"),
         }
+    }
+
+    #[test]
+    fn test_column_properties_data_governance_tags_parses_map() {
+        let yaml = "\
+name: email
+description: Customer email
+data_governance_tags:
+  my-project/data_class: email
+";
+        let parsed: ColumnProperties = dbt_yaml::from_str(yaml).unwrap();
+        let tags = parsed
+            .data_governance_tags
+            .expect("data_governance_tags should deserialize");
+        assert_eq!(tags.len(), 1);
+        assert_eq!(
+            tags.get("my-project/data_class").map(String::as_str),
+            Some("email")
+        );
+    }
+
+    #[test]
+    fn test_column_properties_data_governance_tags_empty_map_preserved() {
+        let yaml = "\
+name: email
+data_governance_tags: {}
+";
+        let parsed: ColumnProperties = dbt_yaml::from_str(yaml).unwrap();
+        let tags = parsed
+            .data_governance_tags
+            .as_ref()
+            .expect("explicit empty map must remain Some(empty)");
+        assert!(tags.is_empty());
+
+        let result = process_columns(Some(&vec![parsed]), None).unwrap();
+        assert_eq!(result[0].data_governance_tags, Some(IndexMap::new()));
+    }
+
+    #[test]
+    fn test_column_properties_data_governance_tags_rejects_non_map() {
+        let yaml_list = "\
+name: email
+data_governance_tags:
+  - my-project/data_class
+";
+        assert!(dbt_yaml::from_str::<ColumnProperties>(yaml_list).is_err());
+
+        let yaml_scalar = "\
+name: email
+data_governance_tags: email
+";
+        assert!(dbt_yaml::from_str::<ColumnProperties>(yaml_scalar).is_err());
+
+        let yaml_number = "\
+name: email
+data_governance_tags: 123
+";
+        assert!(dbt_yaml::from_str::<ColumnProperties>(yaml_number).is_err());
+
+        let yaml_bool = "\
+name: email
+data_governance_tags: true
+";
+        assert!(dbt_yaml::from_str::<ColumnProperties>(yaml_bool).is_err());
+    }
+
+    #[test]
+    fn test_process_columns_data_governance_tags_top_level_overrides_config() {
+        let yaml_config_only = "\
+name: email
+config:
+  data_governance_tags:
+    my-project/data_class: pii
+";
+        let yaml_both = "\
+name: ssn
+data_governance_tags:
+  my-project/data_class: ssn
+config:
+  data_governance_tags:
+    my-project/data_class: public
+";
+        let col_cfg: ColumnProperties = dbt_yaml::from_str(yaml_config_only).unwrap();
+        let col_both: ColumnProperties = dbt_yaml::from_str(yaml_both).unwrap();
+        let col_plain = make_col("id", "Primary key");
+
+        let result = process_columns(Some(&vec![col_cfg, col_both, col_plain]), None).unwrap();
+        assert_eq!(
+            result[0]
+                .data_governance_tags
+                .as_ref()
+                .and_then(|m| m.get("my-project/data_class"))
+                .map(String::as_str),
+            Some("pii")
+        );
+        assert_eq!(
+            result[1]
+                .data_governance_tags
+                .as_ref()
+                .and_then(|m| m.get("my-project/data_class"))
+                .map(String::as_str),
+            Some("ssn")
+        );
+        assert!(result[2].data_governance_tags.is_none());
+    }
+
+    #[test]
+    fn test_dbt_column_serialize_omits_none_data_governance_tags() {
+        let col = make_col("id", "Primary key");
+        let processed = process_columns(Some(&vec![col]), None).unwrap();
+        let serialized = serde_json::to_value(&*processed[0]).unwrap();
+        assert!(
+            serialized.get("data_governance_tags").is_none(),
+            "None data_governance_tags should be omitted from serialized output"
+        );
+    }
+
+    #[test]
+    fn test_version_column_properties_preserves_data_governance_tags() {
+        let yaml = "\
+name: email
+data_governance_tags:
+  123456789012/classification: email
+";
+        let version_col: VersionColumnProperties = dbt_yaml::from_str(yaml).unwrap();
+        let col = version_col
+            .to_column_properties()
+            .expect("named version column should convert");
+        let tags = col
+            .data_governance_tags
+            .expect("data_governance_tags should survive to_column_properties");
+        assert_eq!(
+            tags.get("123456789012/classification").map(String::as_str),
+            Some("email")
+        );
     }
 }
 

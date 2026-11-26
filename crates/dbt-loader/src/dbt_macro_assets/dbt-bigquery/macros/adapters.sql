@@ -141,6 +141,7 @@
     {#-- BigQuery: build STRUCT-aware valid column names (leaves + intermediate paths) --#}
     {% set existing_columns = adapter.get_columns_in_relation(relation) %}
     {% set valid_names = [] %}
+    {% set record_names = [] %}
     {% for col in existing_columns %}
       {% for flat_col in col.flatten() %}
         {% set parts = flat_col.name.split(".") %}
@@ -149,11 +150,67 @@
           {% if prefix not in valid_names %}
             {% do valid_names.append(prefix) %}
           {% endif %}
+          {% if i < (parts | length) %}
+            {% set prefix_lower = prefix | lower %}
+            {% if prefix_lower not in record_names %}
+              {% do record_names.append(prefix_lower) %}
+            {% endif %}
+          {% endif %}
         {% endfor %}
       {% endfor %}
     {% endfor %}
     {% set filtered_columns = validate_doc_columns(relation, model.columns, valid_names) %}
-    {% do alter_column_comment(relation, filtered_columns) %}
+    {# DIVERGENCE BEGIN: On Fusion (2.x), persist BigQuery column-level data_governance_tags
+       via batched ALTER TABLE ... ALTER COLUMN DDL until the BigQuery ADBC driver adds
+       REST dataGovernanceTagsInfo support. Validate upfront before mutating any column. #}
+    {% if dbt_version.startswith('2.') %}
+      {% set dg_tags_sql = bigquery__get_alter_column_data_governance_tags_sql(relation, filtered_columns, record_names) %}
+      {% set rollback_clear_cols = {} %}
+      {% set remaining_dg_cols = {} %}
+      {% for col_name in filtered_columns %}
+        {% set col = filtered_columns[col_name] %}
+        {% set raw_tags = col['data_governance_tags'] if ('data_governance_tags' in col) else none %}
+        {% if raw_tags is defined and raw_tags is not none and raw_tags is mapping and (raw_tags | length) == 0 %}
+          {% set ns = namespace(has_pt=false) %}
+          {% if ('policy_tags' in col) and col['policy_tags'] is not none %}
+            {% set raw_pt = col['policy_tags'] %}
+            {% if raw_pt is string %}
+              {% if (raw_pt | trim | length) > 0 %}{% set ns.has_pt = true %}{% endif %}
+            {% else %}
+              {% for pt in raw_pt %}
+                {% if pt is string and (pt | trim | length) > 0 %}{% set ns.has_pt = true %}{% endif %}
+              {% endfor %}
+            {% endif %}
+          {% endif %}
+          {% if ns.has_pt %}
+            {% do rollback_clear_cols.update({col_name: col}) %}
+          {% else %}
+            {% do remaining_dg_cols.update({col_name: col}) %}
+          {% endif %}
+        {% else %}
+          {% do remaining_dg_cols.update({col_name: col}) %}
+        {% endif %}
+      {% endfor %}
+      {% if (rollback_clear_cols | length) > 0 %}
+        {% set pre_clear_sql = bigquery__get_alter_column_data_governance_tags_sql(relation, rollback_clear_cols, record_names) %}
+        {% if pre_clear_sql %}
+          {% do run_query(pre_clear_sql) %}
+        {% endif %}
+        {% do alter_column_comment(relation, filtered_columns) %}
+        {% set post_sql = bigquery__get_alter_column_data_governance_tags_sql(relation, remaining_dg_cols, record_names) %}
+        {% if post_sql %}
+          {% do run_query(post_sql) %}
+        {% endif %}
+      {% else %}
+        {% do alter_column_comment(relation, filtered_columns) %}
+        {% if dg_tags_sql %}
+          {% do run_query(dg_tags_sql) %}
+        {% endif %}
+      {% endif %}
+    {% else %}
+      {% do alter_column_comment(relation, filtered_columns) %}
+    {% endif %}
+    {# DIVERGENCE END #}
   {% endif %}
 {% endmacro %}
 
@@ -176,6 +233,114 @@
 {% macro bigquery__alter_column_comment(relation, column_dict) -%}
   {% do adapter.update_columns(relation, column_dict) %}
 {% endmacro %}
+
+{# DIVERGENCE BEGIN: Fusion-only helpers emitting batched ALTER COLUMN DDL for data_governance_tags. #}
+{% macro bigquery__alter_column_data_governance_tags(relation, column_dict, record_columns=none) -%}
+  {% set sql = bigquery__get_alter_column_data_governance_tags_sql(relation, column_dict, record_columns) %}
+  {% if sql %}
+    {% do run_query(sql) %}
+  {% endif %}
+{% endmacro %}
+
+{% macro bigquery__get_alter_column_data_governance_tags_sql(relation, column_dict, record_columns=none) -%}
+  {%- set record_lower = [] -%}
+  {%- if record_columns is not none -%}
+    {%- for rec_name in record_columns -%}
+      {%- do record_lower.append(rec_name | lower) -%}
+    {%- endfor -%}
+  {%- endif -%}
+  {%- set actions = [] -%}
+  {%- for col_name in column_dict -%}
+    {%- set col = column_dict[col_name] -%}
+    {%- set raw_tags = col['data_governance_tags'] if ('data_governance_tags' in col) else none -%}
+    {%- if raw_tags is defined and raw_tags is not none -%}
+      {%- if raw_tags is not mapping -%}
+        {{ exceptions.raise_compiler_error(
+          "Invalid `data_governance_tags` for column '" ~ col_name ~ "': expected a mapping of {'<parent_id>/<tag_key>': '<tag_value>'}."
+        ) }}
+      {%- endif -%}
+      {%- set has_entries = (raw_tags | length) > 0 -%}
+      {%- if relation.type != 'table' -%}
+        {%- if has_entries -%}
+          {{ exceptions.raise_compiler_error(
+            "Column '" ~ col_name ~ "' specifies `data_governance_tags`, which BigQuery only supports on table columns (not views, materialized views, snapshots, or external tables)."
+          ) }}
+        {%- endif -%}
+      {%- else -%}
+        {%- set dtype_raw = (col['data_type'] if ('data_type' in col and col['data_type'] is not none) else '') | lower -%}
+        {%- set dtype_norm = dtype_raw.split() | join('') -%}
+        {%- set is_record_dtype = (dtype_norm in ['record', 'struct', 'array<struct>', 'array<record>']) or ('struct<' in dtype_norm) or ('record<' in dtype_norm) -%}
+        {%- set is_record = is_record_dtype or ((col_name | lower) in record_lower) -%}
+        {%- if is_record -%}
+          {%- if has_entries -%}
+            {{ exceptions.raise_compiler_error(
+              "Column '" ~ col_name ~ "' is a RECORD/STRUCT column and cannot have `data_governance_tags` attached directly. Attach `data_governance_tags` to leaf fields instead."
+            ) }}
+          {%- endif -%}
+        {%- elif '.' in col_name -%}
+          {{ exceptions.raise_compiler_error(
+            "Column '" ~ col_name ~ "' specifies `data_governance_tags` on a nested STRUCT field. BigQuery ALTER COLUMN DDL does not accept dotted paths; use REST tables.patch (or update_columns in dbt-bigquery 1.x) for nested leaves."
+          ) }}
+        {%- else -%}
+          {%- if has_entries and ('policy_tags' in col) and col['policy_tags'] is not none -%}
+            {%- set raw_pt = col['policy_tags'] -%}
+            {%- if raw_pt is string -%}
+              {%- if (raw_pt | trim | length) > 0 -%}
+                {{ exceptions.raise_compiler_error(
+                  "Column '" ~ col_name ~ "' cannot specify both `policy_tags` and `data_governance_tags`. BigQuery does not allow both on the same column."
+                ) }}
+              {%- endif -%}
+            {%- else -%}
+              {%- for pt in raw_pt -%}
+                {%- if pt is string and (pt | trim | length) > 0 -%}
+                  {{ exceptions.raise_compiler_error(
+                    "Column '" ~ col_name ~ "' cannot specify both `policy_tags` and `data_governance_tags`. BigQuery does not allow both on the same column."
+                  ) }}
+                {%- endif -%}
+              {%- endfor -%}
+            {%- endif -%}
+          {%- endif -%}
+          {%- set tuples = [] -%}
+          {%- for tag_key, tag_value in raw_tags.items() -%}
+            {%- if tag_key is not string -%}
+              {{ exceptions.raise_compiler_error(
+                "Invalid `data_governance_tags` key for column '" ~ col_name ~ "': expected string in '<parent_id>/<tag_key>' format."
+              ) }}
+            {%- endif -%}
+            {%- set parts = tag_key.split('/') -%}
+            {%- set has_ws = (tag_key.split() | join('')) != tag_key -%}
+            {%- if (parts | length) != 2 or (parts[0] | length) == 0 or (parts[1] | length) == 0 or has_ws -%}
+              {{ exceptions.raise_compiler_error(
+                "Invalid `data_governance_tags` key '" ~ tag_key ~ "' for column '" ~ col_name ~ "': expected '<parent_id>/<tag_key>' (e.g. 'my-project/data_class' or '123456789/data_class') with no whitespace."
+              ) }}
+            {%- endif -%}
+            {%- if tag_value is not string or (tag_value | trim | length) == 0 or (tag_value | trim) != tag_value -%}
+              {{ exceptions.raise_compiler_error(
+                "Invalid `data_governance_tags` value for key '" ~ tag_key ~ "' on column '" ~ col_name ~ "': expected a non-empty tag value short name string without leading or trailing whitespace."
+              ) }}
+            {%- endif -%}
+            {%- if '/' in tag_value -%}
+              {{ exceptions.raise_compiler_error(
+                "Invalid `data_governance_tags` value '" ~ tag_value ~ "' for key '" ~ tag_key ~ "' on column '" ~ col_name ~ "': BigQuery expects the leaf tag value short name (e.g. 'email'), not a hierarchical path."
+              ) }}
+            {%- endif -%}
+            {%- set key_literal = '"' ~ (tag_key | replace('\\', '\\\\') | replace('"', '\\"') | replace('\n', '\\n') | replace('\r', '\\r')) ~ '"' -%}
+            {%- set value_literal = '"' ~ (tag_value | replace('\\', '\\\\') | replace('"', '\\"') | replace('\n', '\\n') | replace('\r', '\\r')) ~ '"' -%}
+            {%- do tuples.append('(' ~ key_literal ~ ', ' ~ value_literal ~ ')') -%}
+          {%- endfor -%}
+          {%- set quoted_name = adapter.quote(col_name) -%}
+          {%- do actions.append('alter column ' ~ quoted_name ~ ' set options (data_governance_tags=[' ~ (tuples | join(', ')) ~ '])') -%}
+        {%- endif -%}
+      {%- endif -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- if (actions | length) == 0 -%}
+    {{ return('') }}
+  {%- else -%}
+    {{ return('alter ' ~ relation.type ~ ' ' ~ relation ~ '\n' ~ (actions | join(',\n'))) }}
+  {%- endif -%}
+{%- endmacro %}
+{# DIVERGENCE END #}
 
 {% macro bigquery__alter_relation_add_columns(relation, add_columns) %}
 

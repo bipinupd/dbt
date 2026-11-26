@@ -6,7 +6,7 @@ use dbt_adbc::Statement;
 use serde_json::json;
 use std::sync::Mutex;
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct CapturedUpdate {
     options: BTreeMap<String, String>,
     executions: usize,
@@ -200,4 +200,117 @@ fn no_metadata_skips_execution() {
         assert_eq!(captured.executions, 0);
         assert!(captured.options.is_empty());
     }
+}
+
+fn try_update_columns(columns: serde_json::Value) -> AdapterResult<CapturedUpdate> {
+    let adapter = AdapterImpl::new(engine(Bigquery), None);
+    let env = Environment::new();
+    let state = State::new_for_env(&env);
+    let relation: Arc<dyn BaseRelation> = Arc::new(Relation::new(
+        Bigquery,
+        "project".to_string(),
+        "dataset".to_string(),
+        "table".to_string(),
+    ));
+    let captured = Arc::new(Mutex::new(CapturedUpdate::default()));
+    let mut conn = CapturingConnection(captured.clone());
+    let columns = serde_json::from_value(columns).unwrap();
+    adapter.update_columns_descriptions(
+        &state,
+        &mut conn,
+        &relation,
+        columns,
+        CancellationToken::never_cancels(),
+    )?;
+    Ok(std::mem::take(&mut *captured.lock().unwrap()))
+}
+
+#[test]
+fn data_governance_tags_alone_skips_adbc_execution() {
+    let captured = update_columns(json!({
+        "email": {
+            "name": "email",
+            "data_governance_tags": {"my-project/data_class": "email"}
+        }
+    }));
+    assert_eq!(captured.executions, 0);
+    assert!(captured.options.is_empty());
+}
+
+#[test]
+fn data_governance_tags_with_description_sends_description_only() {
+    assert_update(
+        json!({
+            "email": {
+                "name": "email",
+                "description": "Customer email",
+                "data_governance_tags": {"my-project/data_class": "email"}
+            }
+        }),
+        json!({"email": "Customer email"}),
+        json!({}),
+    );
+}
+
+#[test]
+fn both_policy_tags_and_data_governance_tags_errors() {
+    let tag = "projects/project/locations/us/taxonomies/taxonomy/policyTags/email";
+    let err = try_update_columns(json!({
+        "email": {
+            "name": "email",
+            "policy_tags": [tag],
+            "data_governance_tags": {"my-project/data_class": "email"}
+        }
+    }))
+    .unwrap_err();
+    assert_eq!(err.kind(), AdapterErrorKind::Configuration);
+    assert!(
+        err.message()
+            .contains("cannot specify both `policy_tags` and `data_governance_tags`"),
+        "unexpected error: {}",
+        err.message()
+    );
+}
+
+#[test]
+fn policy_tags_with_empty_data_governance_tags_allowed() {
+    let tag = "projects/project/locations/us/taxonomies/taxonomy/policyTags/email";
+    assert_update(
+        json!({
+            "email": {
+                "name": "email",
+                "policy_tags": [tag],
+                "data_governance_tags": {}
+            }
+        }),
+        json!({}),
+        json!({"email": [tag]}),
+    );
+}
+
+#[test]
+fn mapping_valued_policy_tags_with_data_governance_tags_allowed() {
+    let captured = update_columns(json!({
+        "email": {
+            "name": "email",
+            "policy_tags": [{"masking_policy": "mask_email"}],
+            "data_governance_tags": {"my-project/data_class": "email"}
+        }
+    }));
+    assert_eq!(captured.executions, 0);
+}
+
+#[test]
+fn blank_string_policy_tags_with_data_governance_tags_allowed() {
+    let res = try_update_columns(json!({
+        "email": {
+            "name": "email",
+            "policy_tags": ["", "   "],
+            "data_governance_tags": {"my-project/data_class": "email"}
+        }
+    }));
+    assert!(
+        res.is_ok(),
+        "blank/whitespace-only policy_tags entries must not falsely conflict with data_governance_tags"
+    );
 }

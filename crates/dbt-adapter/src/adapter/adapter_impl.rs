@@ -2928,6 +2928,27 @@ impl AdapterImpl {
                     })
                     .collect::<BTreeMap<String, Vec<String>>>();
 
+                // BigQuery prohibits attaching both legacy Data Catalog policy tags and
+                // IAM Data Governance tags to the same column.
+                for (name, col) in &columns {
+                    let has_dgt = col
+                        .data_governance_tags
+                        .as_ref()
+                        .is_some_and(|tags| !tags.is_empty());
+                    let has_non_empty_policy_tag = column_to_policy_tags
+                        .get(name)
+                        .is_some_and(|tags| tags.iter().any(|t| !t.trim().is_empty()));
+                    if has_dgt && has_non_empty_policy_tag {
+                        return Err(AdapterError::new(
+                            AdapterErrorKind::Configuration,
+                            format!(
+                                "Column '{name}' cannot specify both `policy_tags` and `data_governance_tags`. \
+                                BigQuery does not allow both on the same column."
+                            ),
+                        ));
+                    }
+                }
+
                 // Skip the ADBC round-trip (and its ETag-race exposure) when
                 // there is nothing to update. Matches dbt-core Python's
                 // `if len(columns) == 0: return` guard in dbt-bigquery's
